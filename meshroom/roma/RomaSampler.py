@@ -1,4 +1,4 @@
-__version__ = "1.1"
+__version__ = "1.3"
 
 import os 
 from pathlib import Path
@@ -36,14 +36,14 @@ class RomaSampler(desc.CommandLineNode):
             value="",
         ),
         desc.File(
-            name="warpFolder",
-            label="warp folder",
+            name="warpArchive",
+            label="Warp Archive",
             description="",
             value=""
         ),
         desc.File(
-            name="confidenceFolder",
-            label="confidence folder",
+            name="confidenceArchive",
+            label="Confidence Archive",
             description="",
             value=""
         ),
@@ -60,6 +60,13 @@ class RomaSampler(desc.CommandLineNode):
             description="Minimal confidence threshold.",
             value=0.15,
             range=(0.0, 1.0, 0.01)
+        ),
+        desc.IntParam(
+            name="radiusMP",
+            label="MP radius",
+            description="Max Pooling radius. Only the best points in a circle of given radius will be kept.",
+            value=16,
+            range=(0, 128, 1)
         ),
         desc.File(
             name="filtersFolder",
