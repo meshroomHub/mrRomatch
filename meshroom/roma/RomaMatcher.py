@@ -1,4 +1,4 @@
-__version__ = "2.0"
+__version__ = "2.1"
 
 import os 
 from pathlib import Path
@@ -11,9 +11,10 @@ class RomaMatcher(desc.CommandLineNode):
     documentation = """
     Compute ROMA warp and confidence images on a list of images pairs, using the per-image data of RomaPrepare.
     Each unordered pair is computed once; only the listed directions are refined (both when Check Loops is on).
+    The RoMa setting (resolutions, number of refinement stages) is the one chosen in RomaPrepare.
 
     Memory: a background loader reads the views of the job's block ahead of the GPU and keeps their DINO features
-    and resized images in RAM (about 25 MB per view, float16). Blocks are counted in image pairs; smaller blocks
+    and resized images in RAM (about 25 MB per view in the precise setting, float16). Blocks are counted in image pairs; smaller blocks
     lower the RAM per job.
 
     The refiners are compiled with torch.compile on Ampere and newer GPUs; the first pair of each job pays the compile time.
@@ -58,7 +59,7 @@ class RomaMatcher(desc.CommandLineNode):
         desc.FloatParam(
             name="loopThreshold",
             label="Allowed loop error",
-            description="Loop consistency max error. The distance between the original coordinates and the back and forth coordinates.",
+            description="Loop consistency max error. The distance between the original coordinates and the back and forth coordinates, in pixels of the warp image.",
             value=3.0,
             range=(0.0, 10.0, 1.0),
             enabled=lambda node: node.checkLoops.value

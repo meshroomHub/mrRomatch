@@ -8,7 +8,7 @@ def filter_matches(inputSfMData, existingTracks, outputFilename):
     
     from pyalicevision import track as avtrack
 
-    # Todo : I need to find a way to guess it automatically.
+    # Reference resolution for distances, independent of the RoMa setting
     romaWidth = 1280
     romaHeight = 1280
 

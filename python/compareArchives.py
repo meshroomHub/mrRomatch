@@ -5,8 +5,6 @@ import h5py
 import hdf5plugin  # noqa: F401  (registers the LZ4 filter)
 import numpy as np
 
-PIXEL_SCALE = 1280.0
-
 
 def _read(f, key):
     """
@@ -41,7 +39,7 @@ def compare(warp_a, conf_a, warp_b, conf_b, keys, min_conf=0.15):
 
     Returns:
         list[dict]: One dict per key with ``key``, ``in_a``, ``in_b``, ``warp_px_mean``,
-            ``warp_px_max`` (Euclidean xy difference x 1280 over pixels confident in both,
+            ``warp_px_max`` (Euclidean xy difference in warp pixels over pixels confident in both,
             NaN if none), ``conf_abs_mean`` (mean |conf difference| in [0, 1] over all
             pixels, NaN if shapes differ), ``px_a`` and ``px_b`` (confident pixel counts).
     """
@@ -76,8 +74,10 @@ def compare(warp_a, conf_a, warp_b, conf_b, keys, min_conf=0.15):
                     mask = (ca_f >= min_conf) & (cb_f >= min_conf)
                     mask = mask.reshape(mask.shape[:2])
                     if mask.any():
-                        d = (wA[..., :2].astype(np.float32) - wB[..., :2].astype(np.float32))[mask]
-                        dist = np.sqrt((d ** 2).sum(axis=-1)) * PIXEL_SCALE
+                        # x and y are normalized, scale them to the warp size
+                        scale = np.array([wA.shape[1], wA.shape[0]], dtype=np.float32)
+                        d = ((wA[..., :2].astype(np.float32) - wB[..., :2].astype(np.float32)) * scale)[mask]
+                        dist = np.sqrt((d ** 2).sum(axis=-1))
                         row["warp_px_mean"] = float(dist.mean())
                         row["warp_px_max"] = float(dist.max())
             rows.append(row)

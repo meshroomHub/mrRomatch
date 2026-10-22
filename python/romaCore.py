@@ -14,9 +14,16 @@ from romav2.device import device
 from romav2.features import Descriptor
 from romav2.romav2 import _interpolate_warp_and_confidence, _map_confidence
 
+# RoMa v2 settings supported here, see `RoMaV2.apply_setting`; the benchmark settings are left out
+SETTINGS = ("turbo", "fast", "base", "precise")
 
-def load_model():
-    """Load RoMa v2 in `precise` mode.
+
+def load_model(setting="precise"):
+    """Load RoMa v2 in the given setting.
+
+    Args:
+        setting: One of :data:`SETTINGS`. It sets the low/high resolutions
+            and whether a high resolution stage runs.
 
     Returns:
         The RoMaV2 model.
@@ -29,7 +36,7 @@ def load_model():
         dinov3_path = os.path.join(modelPath, "dinov3")
     cfg = RoMaV2.Cfg(descriptor=Descriptor.Cfg(module_path=dinov3_path), weights=weights, compile=False)
     model = RoMaV2(cfg=cfg)
-    model.apply_setting("precise")
+    model.apply_setting(setting)
     return model
 
 
@@ -83,20 +90,25 @@ def _resize(img, size):
     return F.interpolate(img, size=size, mode="bicubic", align_corners=False, antialias=True)
 
 
+def _has_hr(model):
+    return model.H_hr is not None and model.W_hr is not None
+
+
 @torch.inference_mode()
-def preprocess(pil, size_lr=(800, 800), size_hr=(1280, 1280)):
+def preprocess(model, pil):
     """Convert a PIL image to the low and high resolution inputs of RoMa.
 
     Args:
+        model: RoMaV2 model, whose setting gives the resolutions.
         pil: PIL image.
-        size_lr: (H, W) of the low resolution image.
-        size_hr: (H, W) of the high resolution image.
 
     Returns:
-        (img_lr, img_hr) float32 tensors (1,3,H,W) on the device.
+        (img_lr, img_hr) float32 tensors (1,3,H,W) on the device; img_hr is
+        None for settings without a high resolution stage.
     """
     img = RoMaV2._load_image(None, pil)
-    return _resize(img, size_lr), _resize(img, size_hr)
+    img_hr = _resize(img, (model.H_hr, model.W_hr)) if _has_hr(model) else None
+    return _resize(img, (model.H_lr, model.W_lr)), img_hr
 
 
 @torch.inference_mode()
@@ -133,25 +145,28 @@ def coarse(model, fA, fB):
 
 
 @torch.inference_mode()
-def fine(model, img_lr, img_hr):
-    """Compute refiner features of one image at both resolutions.
+def fine(model, img_lr, img_hr=None):
+    """Compute refiner features of one image at each resolution.
 
     Args:
         model: RoMaV2 model.
         img_lr: low resolution image (1,3,H,W).
-        img_hr: high resolution image (1,3,H,W).
+        img_hr: high resolution image (1,3,H,W), or None without a high resolution stage.
 
     Returns:
-        (features_lr, features_hr), dicts keyed by patch size.
+        Tuple with one dict keyed by patch size per stage: (features_lr,) or
+        (features_lr, features_hr).
     """
     _check(model)
+    if img_hr is None:
+        return (model.refiner_features(img_lr),)
     return model.refiner_features(img_lr), model.refiner_features(img_hr)
 
 
 @torch.inference_mode()
 def refine(model, c, fine_A, fine_B, directions=("AB", "BA")):
     """
-    Two-stage refinement of one pair, exactly as `RoMaV2.forward`.
+    One or two-stage refinement of one pair, exactly as `RoMaV2.forward`.
 
     The A→B and B→A refinements are independent chains, so refining one
     direction only gives bit-identical results for that direction at half the cost.
@@ -159,7 +174,7 @@ def refine(model, c, fine_A, fine_B, directions=("AB", "BA")):
     Args:
         model: RoMaV2 model.
         c: batch-1 slice of the output of `coarse`.
-        fine_A: output of `fine` for image A.
+        fine_A: output of `fine` for image A; one stage per resolution.
         fine_B: output of `fine` for image B.
         directions: Directions to refine, subset of ("AB", "BA").
 
@@ -168,7 +183,7 @@ def refine(model, c, fine_A, fine_B, directions=("AB", "BA")):
     """
     _check(model)
     state = {d: (c[f"warp_{d}"], c[f"confidence_{d}"]) for d in directions}
-    for stage in range(2):
+    for stage in range(len(fine_A)):
         fA, fB = fine_A[stage], fine_B[stage]
         H, W = (model.H_lr, model.W_lr) if stage == 0 else (model.H_hr, model.W_hr)
         scale_factor = torch.tensor((W / model.anchor_width, H / model.anchor_height), device=device)

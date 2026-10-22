@@ -62,7 +62,8 @@ def _refine_directions(listed, params):
 
 
 def _fine_of(model, view, device):
-    return romaCore.fine(model, view["img_lr"].to(device).float(), view["img_hr"].to(device).float())
+    img_hr = view["img_hr"].to(device).float() if view["img_hr"] is not None else None
+    return romaCore.fine(model, view["img_lr"].to(device).float(), img_hr)
 
 
 def _cache_size(model, index, first, device):
@@ -267,11 +268,12 @@ def compute_matches(inputSfMData, imagePairsList, minConfidence, outputWarpArchi
         checkLoops (bool): Apply loop-closure filtering.
         loopThreshold (float): Maximum round-trip error in pixels.
         outputCovarianceFlag (bool): Also write the covariance archive.
-        prepareArchive (str): Archive written by RomaPrepare.
+        prepareArchive (str): Archive written by RomaPrepare; it also gives the RoMa setting.
         rangeIteration (int): Index of the current processing block.
         rangeBlocksCount (int): Total number of processing blocks.
     """
     from common import avmic, get_imageinfos_from_sfmdata
+    from prepare import read_setting
 
     infos = get_imageinfos_from_sfmdata(inputSfMData)
     order = {view_id: rank for rank, view_id in enumerate(infos)}
@@ -289,8 +291,10 @@ def compute_matches(inputSfMData, imagePairsList, minConfidence, outputWarpArchi
 
     model = None
     if pairs_canon:
-        logging.info("Loading model")
-        model = romaCore.load_model()
+        with h5py.File(prepareArchive, "r") as index:
+            setting = read_setting(index, {v for pair in pairs_canon for v in pair})
+        logging.info(f"Loading model, setting {setting}")
+        model = romaCore.load_model(setting)
         compiled = romaCore.enable_compile(model)
         logging.info("Refiners compiled" if compiled else "Refiners not compiled: GPU older than Ampere")
     params = Params(min_confidence=minConfidence, check_loops=checkLoops, loop_threshold=loopThreshold,

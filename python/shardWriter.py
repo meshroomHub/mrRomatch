@@ -59,7 +59,7 @@ class ShardWriter:
         self._file.create_dataset(key, data=data, dtype=dtype, **hdf5plugin.LZ4(), chunks=True)
         self.keys.add(key)
 
-    def write_group(self, key, arrays, dtype):
+    def write_group(self, key, arrays, dtype, attrs=None):
         """
         Create a group of LZ4-compressed datasets in the shard.
 
@@ -67,8 +67,10 @@ class ShardWriter:
             key (str): Group name.
             arrays (dict[str, numpy.ndarray]): Datasets to store by name.
             dtype: Stored NumPy dtype.
+            attrs (dict | None): Attributes to set on the group.
         """
         group = self._file.create_group(key)
+        group.attrs.update(attrs or {})
         for name, array in arrays.items():
             group.create_dataset(name, data=array, dtype=dtype, **hdf5plugin.LZ4(), chunks=True)
         self.keys.add(key)

@@ -27,7 +27,8 @@ def compute_masks(inputSfMData, outputDirectory, imagePairsList, existingTracks,
     from pyalicevision import system as avsys
     from pyalicevision import track as avtrack
     
-    # Todo : I need to find a way to guess it automatically.
+    # Reference resolution for distances and radii, independent of the RoMa setting
+    # (masks are resampled to the warp size by MatchMasking).
     romaWidth = 1280
     romaHeight = 1280
 

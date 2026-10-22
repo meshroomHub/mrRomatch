@@ -25,7 +25,9 @@ def _process_pair(args):
 
         H, W = warp.shape[0], warp.shape[1]
 
+        # Feature coordinates are normalized, scale them to the warp size
         coords = np.array([[f[0][2], f[0][3], f[1][2], f[1][3]] for f in features], dtype=np.float32)
+        coords *= np.array([W, H, W, H], dtype=np.float32)
 
         ixm = np.floor(coords[:, 0]).astype(int)
         iym = np.floor(coords[:, 1]).astype(int)
@@ -61,10 +63,6 @@ def _process_pair(args):
     return result
 
 def filter_matches(inputSfMData, imagePairsList, warpArchive, confidenceArchive, featuresFolder, matchesFolder, output):
-
-    # Todo : I need to find a way to guess it automatically.
-    romaWidth = 1280
-    romaHeight = 1280
     
     # Parse sfm
     iinfos = get_imageinfos_from_sfmdata(inputSfMData)
@@ -109,8 +107,9 @@ def filter_matches(inputSfMData, imagePairsList, warpArchive, confidenceArchive,
             regions = avfeat.SiftRegions()
             regions.Load(f"{featuresFolder}/{viewId}.{desc_str}.feat", f"{featuresFolder}/{viewId}.{desc_str}.desc")
             
-            scaley = romaHeight / iinfos[viewId].height
-            scalex = romaWidth / iinfos[viewId].width
+            # Normalized coordinates, scaled to each warp size when checked
+            scaley = 1.0 / iinfos[viewId].height
+            scalex = 1.0 / iinfos[viewId].width
 
             features_cache[key] = np.array([[f.x() * scalex, f.y() * scaley] for f in regions.Features()], dtype=np.float32)
 
@@ -132,7 +131,7 @@ def filter_matches(inputSfMData, imagePairsList, warpArchive, confidenceArchive,
 
             for match in matchesPerDesc:
 
-                # Scale points to ROMA scale
+                # Normalized points
                 rx = featuresRef[match._i, 0]
                 ry = featuresRef[match._i, 1]
                 ox = featuresOther[match._j, 0]
@@ -153,7 +152,7 @@ def filter_matches(inputSfMData, imagePairsList, warpArchive, confidenceArchive,
             featureIds = (t1, t2)
             pairsPerReference.setdefault(viewPair, []).append(featureIds)
 
-    # Triplet distance threshold (Roma pixels)
+    # Triplet distance threshold (pixels of the warp image)
     tau = 4.0
 
     # Directed leaf-leaf pairs that passed the triangle constraint.
