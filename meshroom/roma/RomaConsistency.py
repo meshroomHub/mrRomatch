@@ -1,4 +1,4 @@
-__version__ = "1.0"
+__version__ = "2.0"
 
 import os 
 from pathlib import Path
@@ -16,6 +16,8 @@ class RomaConsistency(desc.CommandLineNode):
     A triplet is composed of one item (A) in the reference SfmData and two consecutive items (B,C) in the framesSfmData.
     framesSfmData is assumed to be a sequence.
     We check that the estimated cumulated motion A->B->C is close to the motion of A->C
+    Warps and confidences are read from the RomaMatcher archives. Every reference->frame
+    confidence found is written to the output archive, filtered when possible.
     """    
 
     size = avpar.DynamicViewsSize('referenceSfMData')
@@ -38,24 +40,24 @@ class RomaConsistency(desc.CommandLineNode):
             value="",
         ),
         desc.ListAttribute(
-            name="warpFolders",
-            label="Warp folders",
-            description="List of folders where warp files can be looked up.",
+            name="warpArchives",
+            label="Warp Archives",
+            description="List of warp archives where warps can be looked up.",
             elementDesc=desc.File(
-                name="warpFolder",
-                label="Warp folder",
+                name="warpArchive",
+                label="Warp Archive",
                 description="",
                 value=""
             ),
             exposed=True
         ),
         desc.ListAttribute(
-            name="confidenceFolders",
-            label="Confidence folders",
-            description="List of folders where confidence files can be looked up.",
+            name="confidenceArchives",
+            label="Confidence Archives",
+            description="List of confidence archives where confidences can be looked up.",
             elementDesc=desc.File(
-                name="confidenceFolder",
-                label="Confidence folder",
+                name="confidenceArchive",
+                label="Confidence Archive",
                 description="",
                 value=""
             ),
@@ -72,9 +74,9 @@ class RomaConsistency(desc.CommandLineNode):
 
     outputs = [
         desc.File(
-            name="outputConfidenceFolder",
-            label="Output Confidence folder",
+            name="outputConfidenceArchive",
+            label="Output Confidence Archive",
             description="",
-            value="{nodeCacheFolder}"
+            value="{nodeCacheFolder}/confidence.h5"
         )
     ]

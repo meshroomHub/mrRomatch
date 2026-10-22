@@ -1,4 +1,4 @@
-__version__ = "1.1"
+__version__ = "1.2"
 
 import os 
 from pathlib import Path
@@ -46,8 +46,14 @@ class RomaFeaturesMatcher(desc.CommandLineNode):
             value="",
         ),
         desc.File(
-            name="warpFolder",
-            label="warp folder",
+            name="warpArchive",
+            label="Warp Archive",
+            description="",
+            value=""
+        ),
+        desc.File(
+            name="confidenceArchive",
+            label="Confidence Archive",
             description="",
             value=""
         ),

@@ -5,42 +5,96 @@ from itertools import pairwise
 import os
 import math
 import numpy as np
+from contextlib import ExitStack
+import h5py, hdf5plugin
+from shardWriter import ShardWriter
 
-def parse_folders(inputFolders):
-    if inputFolders is None:
+def parse_archives(inputArchives):
+    """
+    Normalise the archive argument into a deduplicated list of path strings.
+
+    Accepts ``None``, a single path string, or a (possibly nested) list/tuple of
+    path strings. Empty strings and whitespace-only entries are silently ignored.
+    Duplicate paths are removed while preserving order.
+
+    Args:
+        inputArchives: Path string, list/tuple of path strings, or ``None``.
+
+    Returns:
+        list[str]: Ordered, deduplicated list of non-empty archive paths.
+    """
+    if inputArchives is None:
         return []
 
-    if isinstance(inputFolders, (list, tuple)):
-        folders = []
-        for item in inputFolders:
-            folders.extend(parse_folders(item))
+    if isinstance(inputArchives, (list, tuple)):
+        archives = []
+        for item in inputArchives:
+            archives.extend(parse_archives(item))
         deduped = []
         seen = set()
-        for folder in folders:
-            if folder not in seen:
-                deduped.append(folder)
-                seen.add(folder)
+        for archive in archives:
+            if archive not in seen:
+                deduped.append(archive)
+                seen.add(archive)
         return deduped
 
-    if not isinstance(inputFolders, str):
+    if not isinstance(inputArchives, str):
         return []
 
-    raw = inputFolders.strip()
+    raw = inputArchives.strip()
     if len(raw) == 0:
         return []
 
     return [raw]
 
 
-def find_path(folders, filename):
-    for folder in folders:
-        candidate = os.path.join(folder, filename)
-        if os.path.exists(candidate):
-            return candidate
+def find_dataset(archives, key):
+    """
+    Search a list of opened archives for a dataset and return the first match.
+
+    Args:
+        archives (list[h5py.File]): Ordered list of opened HDF5 archives.
+        key (str): Dataset name (e.g. ``"123_456"``).
+
+    Returns:
+        numpy.ndarray | None: Content of the first matching dataset, or ``None``
+            if the key is not found in any of the provided archives.
+    """
+    for archive in archives:
+        if key in archive:
+            return archive[key][()]
     return None
 
-def check_consistency(warp_A_B, warp_A_C, warp_B_C):
 
+def read_warp(archives, key):
+    """
+    Read a warp from the archives as float32, or ``None`` if it is missing.
+    """
+    warp = find_dataset(archives, key)
+    if warp is None:
+        return None
+    return warp.astype(np.float32)
+
+def check_consistency(warp_A_B, warp_A_C, warp_B_C):
+    """
+    Compute the triplet-consistency error for three dense warps.
+
+    Given warps A→B, A→C, and B→C, the function checks whether the composition
+    B→C ∘ A→B agrees with A→C at every pixel. For each pixel in A it follows
+    A→B to a location in B, samples B→C at that location (using the four
+    nearest-neighbour corners), and measures the distance between the result
+    and the direct A→C prediction.
+
+    Args:
+        warp_A_B (numpy.ndarray | None): Dense warp from A to B, shape (H, W, 3)
+            with xy coordinates normalised to [0, 1] in the first two channels.
+        warp_A_C (numpy.ndarray | None): Dense warp from A to C, same layout.
+        warp_B_C (numpy.ndarray | None): Dense warp from B to C, same layout.
+
+    Returns:
+        numpy.ndarray | None: Per-pixel consistency error in pixels, shape
+            (H, W, 1), or ``None`` if any warp is ``None`` or the shapes differ.
+    """
     if warp_A_B is None or warp_A_C is None or warp_B_C is None:
         return None
 
@@ -62,8 +116,9 @@ def check_consistency(warp_A_B, warp_A_C, warp_B_C):
     ixp = ixm + 1
     iyp = iym + 1
     
-    # Create mask for valid coordinates (before clipping)
-    valid = (ixm >= 0) & (iym >= 0) & (ixp < width) & (iyp < height)
+    # Create mask for coordinates inside the image (before clipping)
+    # Neighbors past the last row/column are clipped back onto it
+    valid = (ixm >= 0) & (iym >= 0) & (ixm < width) & (iym < height)
     
     # Clip indices to valid range to prevent out-of-bounds access
     ixm = np.clip(ixm, 0, width - 1)
@@ -96,8 +151,37 @@ def check_consistency(warp_A_B, warp_A_C, warp_B_C):
 
 
 
-def compute_consistency(referenceSfMData, framesSfMData, warpFolders, confidenceFolders, outputConfidenceFolder, maxDistance, rangeIteration, rangeBlocksCount):
-    
+def compute_consistency(referenceSfMData, framesSfMData, warpArchives, confidenceArchives, outputConfidenceArchive, maxDistance, rangeIteration, rangeBlocksCount):
+    """
+    Filter confidence maps using triplet warp consistency across a frame sequence.
+
+    For each reference image in the assigned processing range and for each
+    consecutive frame pair (A, B) in the frame sequence, the function evaluates
+    the consistency of the composition warp(ref→A) ∘ warp(A→B) against
+    warp(ref→B) via :func:`check_consistency`. The per-pixel consistency errors
+    are accumulated by taking the element-wise minimum across all frame pairs,
+    and the confidence map for each ref→frame pair is zeroed out wherever the
+    accumulated error exceeds ``maxDistance``.
+
+    Every ref→frame confidence map found in the input archives is written to
+    ``outputConfidenceArchive``, filtered when a consistency error is available
+    and unchanged otherwise. Each chunk writes its own shard of the output
+    archive and links it into the index.
+
+    Args:
+        referenceSfMData (str): Path to the SfM data file for the reference views.
+        framesSfMData (str): Path to the SfM data file for the frame sequence.
+        warpArchives (list[str] | str | None): One or more HDF5 archives to search
+            for warps. Parsed by :func:`parse_archives`.
+        confidenceArchives (list[str] | str | None): One or more HDF5 archives
+            to search for input confidences.
+        outputConfidenceArchive (str): HDF5 archive where filtered confidences
+            are written (uint8, like RomaMatcher).
+        maxDistance (float): Maximum acceptable consistency error in pixels;
+            confidence is zeroed above this threshold.
+        rangeIteration (int): Index of the current processing block (for parallelization).
+        rangeBlocksCount (int): Total number of processing blocks (for parallelization).
+    """
     from pyalicevision import system as avsys
 
     # Parse sfm
@@ -115,53 +199,55 @@ def compute_consistency(referenceSfMData, framesSfMData, warpFolders, confidence
         
     ref_items = ref_items[rangeStart:rangeEnd]
 
-    for idxRef, (keyref, _) in enumerate(ref_items):
-        
-        previousDistanceMap = None
+    with ExitStack() as stack:
+        warps = [stack.enter_context(h5py.File(path, "r")) for path in parse_archives(warpArchives)]
+        confidences = [stack.enter_context(h5py.File(path, "r")) for path in parse_archives(confidenceArchives)]
+        writer = ShardWriter(outputConfidenceArchive, rangeIteration)
 
-        for idxFrame, (k1, _) in enumerate(frame_items):
+        try:
+            for keyref, _ in ref_items:
 
-            k2 = k1
-            if idxFrame + 1 < len(frame_items):
-                k2, _ = frame_items[idxFrame + 1]
-            
-            # ref -> A
-            pair_string = str(keyref) + "_" + str(k1)
-            path_warp = find_path(warpFolders, pair_string + "_warp.exr")        
-            warp_ref_A = open_image_as_numpy(path_warp)
+                previousDistanceMap = None
 
-            # ref -> B
-            pair_string = str(keyref) + "_" + str(k2)
-            path_warp = find_path(warpFolders, pair_string + "_warp.exr")        
-            warp_ref_B = open_image_as_numpy(path_warp)
+                for idxFrame, (k1, _) in enumerate(frame_items):
 
-            # A -> B
-            pair_string = str(k1) + "_" + str(k2)
-            path_warp = find_path(warpFolders, pair_string + "_warp.exr")          
-            warp_A_B = open_image_as_numpy(path_warp)
+                    k2 = k1
+                    if idxFrame + 1 < len(frame_items):
+                        k2, _ = frame_items[idxFrame + 1]
 
-            distanceMap = check_consistency(warp_ref_A, warp_ref_B, warp_A_B)
+                    # ref -> A, ref -> B, A -> B
+                    warp_ref_A = read_warp(warps, str(keyref) + "_" + str(k1))
+                    warp_ref_B = read_warp(warps, str(keyref) + "_" + str(k2))
+                    warp_A_B = read_warp(warps, str(k1) + "_" + str(k2))
 
-            if previousDistanceMap is not None:
-                if distanceMap is None:
-                    distanceMap = previousDistanceMap
-                else:
-                    distanceMap = np.minimum(distanceMap, previousDistanceMap)
+                    distanceMap = check_consistency(warp_ref_A, warp_ref_B, warp_A_B)
 
-            if distanceMap is None:
-                continue
+                    if previousDistanceMap is not None:
+                        if distanceMap is None:
+                            distanceMap = previousDistanceMap
+                        else:
+                            distanceMap = np.minimum(distanceMap, previousDistanceMap)
 
-            previousDistanceMap = distanceMap
+                    if distanceMap is not None:
+                        previousDistanceMap = distanceMap
 
-            #Read source confidence
-            pair_string = str(keyref) + "_" + str(k1)
-            path_confidence = find_path(confidenceFolders, pair_string + "_confidence.exr")
-            confidence_keyref_A = open_image_as_numpy(path_confidence, True)
-            confidence_keyref_A[distanceMap > maxDistance] = 0.0
+                    #Read source confidence, stored as uint8
+                    pair_string = str(keyref) + "_" + str(k1)
+                    confidence_keyref_A = find_dataset(confidences, pair_string)
+                    if confidence_keyref_A is None:
+                        continue
 
-            #write output
-            path_confidence_output = os.path.join(outputConfidenceFolder, pair_string + "_confidence.exr")
-            save_image(path_confidence_output, confidence_keyref_A, True)
+                    if distanceMap is not None:
+                        rejected = (distanceMap > maxDistance).reshape(confidence_keyref_A.shape[:2])
+                        confidence_keyref_A[rejected] = 0
+
+                    #write output
+                    writer.write(pair_string, confidence_keyref_A, np.uint8)
+        except BaseException:
+            writer.close()
+            raise
+
+        writer.close_and_link()
 
 if __name__ == '__main__':
     import argparse
@@ -174,9 +260,9 @@ if __name__ == '__main__':
     # create the parser for the "warp" sub-command
     parser.add_argument('--referenceSfMData', type=str, help='')
     parser.add_argument('--framesSfMData', type=str, help='')
-    parser.add_argument('--warpFolders', nargs='*', default=None, help='')
-    parser.add_argument('--confidenceFolders', nargs='*', default=None, help='')
-    parser.add_argument('--outputConfidenceFolder', type=str, help='')
+    parser.add_argument('--warpArchives', nargs='*', default=None, help='')
+    parser.add_argument('--confidenceArchives', nargs='*', default=None, help='')
+    parser.add_argument('--outputConfidenceArchive', type=str, help='')
     parser.add_argument('--maxDistance', type=float, help='')
     parser.add_argument('--rangeIteration', type=int, help='', default=0)
     parser.add_argument('--rangeBlocksCount', type=int, help='', default=1)
@@ -185,14 +271,12 @@ if __name__ == '__main__':
 
     args = parser.parse_args()
 
-    print(args.rangeBlocksCount, flush=True)
-
     if hasattr(args, 'func'):
         args.func(referenceSfMData=args.referenceSfMData,
                 framesSfMData=args.framesSfMData,
-                warpFolders=args.warpFolders,
-                confidenceFolders=args.confidenceFolders,
-                outputConfidenceFolder=args.outputConfidenceFolder,
+                warpArchives=args.warpArchives,
+                confidenceArchives=args.confidenceArchives,
+                outputConfidenceArchive=args.outputConfidenceArchive,
                 maxDistance=args.maxDistance,
                 rangeIteration=args.rangeIteration,
                 rangeBlocksCount=args.rangeBlocksCount)
