@@ -66,7 +66,8 @@ class AllListing(desc.Node):
         plist = avmic.PairSet()
         for (kkey, kview) in kviews.items():
             for (key, view) in views.items():
-                plist.append((kkey, key))
+                if kkey != key:
+                    plist.append((kkey, key))
     
         if not avmic.savePairsToFile(chunk.node.imagePairsList.value, plist):
             raise RuntimeError("Error in image pairs list loading")

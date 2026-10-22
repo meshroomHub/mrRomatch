@@ -1,4 +1,4 @@
-__version__ = "1.1"
+__version__ = "2.1"
 
 import os 
 from pathlib import Path
@@ -9,12 +9,21 @@ class RomaMatcher(desc.CommandLineNode):
 
     category = "ROMA"
     documentation = """
-    Compute ROMA warp and confidence images on a list of images pairs.
-    """
-    size = avpar.DynamicViewsSize('inputSfMData')
-    gpu = desc.Level.INTENSIVE
+    Compute ROMA warp and confidence images on a list of images pairs, using the per-image data of RomaPrepare.
+    Each unordered pair is computed once; only the listed directions are refined (both when Check Loops is on).
+    The RoMa setting (resolutions, number of refinement stages) is the one chosen in RomaPrepare.
 
-    parallelization = desc.Parallelization(blockSize=20)
+    Memory: a background loader reads the views of the job's block ahead of the GPU and keeps their DINO features
+    and resized images in RAM (about 25 MB per view in the precise setting, float16). Blocks are counted in image pairs; smaller blocks
+    lower the RAM per job.
+
+    The refiners are compiled with torch.compile on Ampere and newer GPUs; the first pair of each job pays the compile time.
+    """
+    size = avpar.DynamicImagePairsSize('imagePairsList')
+    gpu = desc.Level.INTENSIVE
+    ram = desc.Level.INTENSIVE
+
+    parallelization = desc.Parallelization(blockSize=400)
     commandLineRange = "--rangeIteration {rangeIteration} --rangeBlocksCount {rangeBlocksCount}"
     
 
@@ -35,6 +44,12 @@ class RomaMatcher(desc.CommandLineNode):
             description="Path to a file which contains the list of image pairs to match.",
             value="",
         ),
+        desc.File(
+            name="prepareArchive",
+            label="Prepare Archive",
+            description="Archive written by RomaPrepare for the same SfMData.",
+            value="",
+        ),
         desc.BoolParam(
             name="checkLoops",
             label="Check loop consitency",
@@ -44,7 +59,7 @@ class RomaMatcher(desc.CommandLineNode):
         desc.FloatParam(
             name="loopThreshold",
             label="Allowed loop error",
-            description="Loop consistency max error. The distance between the original coordinates and the back and forth coordinates.",
+            description="Loop consistency max error. The distance between the original coordinates and the back and forth coordinates, in pixels of the warp image.",
             value=3.0,
             range=(0.0, 10.0, 1.0),
             enabled=lambda node: node.checkLoops.value
@@ -61,27 +76,27 @@ class RomaMatcher(desc.CommandLineNode):
             description="Minimal confidence threshold under which the output will be zeroed for compression reasons.",
             value=0.02,
             range=(0.0, 1.0, 0.01)
-        )
+        ),
     ]
 
     outputs = [
         desc.File(
-            name="outputWarpFolder",
-            label="Output Warp folder",
+            name="outputWarpArchive",
+            label="Output Warp Archive",
             description="",
-            value="{nodeCacheFolder}"
+            value="{nodeCacheFolder}/warp.h5"
         ),
         desc.File(
-            name="outputConfidenceFolder",
-            label="Output Confidence folder",
+            name="outputConfidenceArchive",
+            label="Output Confidence Archive",
             description="",
-            value="{nodeCacheFolder}"
+            value="{nodeCacheFolder}/confidence.h5"
         ),
         desc.File(
-            name="outputCovarianceFolder",
-            label="Output Covariance folder",
+            name="outputCovarianceArchive",
+            label="Output Covariance Archive",
             description="",
-            value="{nodeCacheFolder}",
+            value="{nodeCacheFolder}/covariance.h5",
             enabled=lambda node : node.outputCovarianceFlag.value
-        )
+        ),
     ]

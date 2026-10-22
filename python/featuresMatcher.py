@@ -8,9 +8,19 @@ from common import *
 
 import os
 import math
+import h5py, hdf5plugin
 
 def regionToNumpy(region):
+    """
+    Convert the feature positions of a region to a NumPy array.
 
+    Args:
+        region: An AliceVision region object exposing a ``Features()`` method
+            that returns a sequence of objects with ``.x()`` and ``.y()`` accessors.
+
+    Returns:
+        numpy.ndarray: Float64 array of shape (N, 2) where each row is ``[x, y]``.
+    """
     size = len(region.Features())
     array = np.empty(shape=(size, 2))
 
@@ -23,22 +33,55 @@ def regionToNumpy(region):
 
     return array
 
-def compute_featuresMatcher(inputSfMData, imagePairsList, warpFolder, featuresFolder, matchesFolder, masksFolder, masksExtension, minConfidence, rangeIteration, rangeBlocksCount):
-    
+def compute_featuresMatcher(inputSfMData, imagePairsList, warpArchive, confidenceArchive, featuresFolder, matchesFolder, masksFolder, masksExtension, minConfidence, rangeIteration, rangeBlocksCount):
+    """
+    Match DSPSIFT features guided by a dense warp field.
+
+    For each image pair in the assigned processing range the function:
+    - loads DSPSIFT features for both images,
+    - loads the dense warp and confidence EXR files,
+    - optionally applies a binary reference mask to zero out confidence,
+    - for every reference keypoint with sufficient confidence, restricts the
+      search for matching other-image features to the warp-predicted region
+      (using a spatial grid indexed on the other image),
+    - selects the nearest-descriptor neighbour and applies a ratio test
+      (second-best distance must be > 0.8 × best distance),
+    - accumulates accepted matches into a global ``PairwiseMatches`` container
+      and saves them as TXT files prefixed with the range iteration index.
+
+    Args:
+        inputSfMData (str): Path to the input SfM data file.
+        imagePairsList (str): Path to the file listing image pairs to process.
+        warpArchive (str): Archive containing warp arrays.
+        confidenceArchive (str): Archive containing confidence arrays.
+        featuresFolder (str): Directory containing ``.dspsift.feat`` / ``.dspsift.desc``
+            feature files.
+        matchesFolder (str): Directory where output match TXT files are written.
+        masksFolder (str): Directory containing optional binary mask images.
+            Pass an empty string to disable masking.
+        masksExtension (str): File extension of the mask images (e.g. ``"png"``).
+        minConfidence (float): Minimum warp confidence required to consider a
+            reference keypoint for matching.
+        rangeIteration (int): Index of the current processing block (for parallelization).
+        rangeBlocksCount (int): Total number of processing blocks (for parallelization).
+    """
      # Parse sfm
     iinfos = get_imageinfos_from_sfmdata(inputSfMData)
 
     plist = avmic.PairSet()
     if not avmic.loadPairsFromFile(imagePairsList, plist, False):
         raise RuntimeError("Error in image pairs list loading")
-    pairsToProcess = list(plist)
+    pairsToProcessTmp = list(plist)
+    pairsToProcess = list()
+    for pair in pairsToProcessTmp:
+        if not pair[0] in iinfos or not pair[1] in iinfos:
+            continue
+        pairsToProcess.append(pair)
 
-    blockSize = int(len(pairsToProcess) / rangeBlocksCount)
-    rangeStart = rangeIteration * blockSize
-    rangeEnd = rangeStart + blockSize
-    if rangeIteration + 1 == rangeBlocksCount:
-        rangeEnd = len(pairsToProcess)
-
+    (valid, rangeStart, rangeEnd) = avsys.rangeComputation(rangeIteration, rangeBlocksCount, len(pairsToProcess))
+    if not valid:
+        logging.error("Error computing range.")
+        raise RuntimeError("Error computing range.")
     
     pairsToProcess = pairsToProcess[rangeStart:rangeEnd]
     logging.info(f"Processing elements {rangeStart} to {rangeEnd}")
@@ -59,10 +102,13 @@ def compute_featuresMatcher(inputSfMData, imagePairsList, warpFolder, featuresFo
 
         #load warp
         pair_string = str(referenceId) + "_" + str(otherId)
-        path_warp = os.path.join(warpFolder, pair_string + "_warp.exr")
-        path_confidence = os.path.join(warpFolder, pair_string + "_confidence.exr")
-        warp_A_B = open_image_as_numpy(path_warp)
-        confidence_A_B = open_image_as_numpy(path_confidence, True)
+        with h5py.File(warpArchive, "r") as f_warp_h5, \
+             h5py.File(confidenceArchive, "r") as f_conf_h5:
+            if pair_string not in f_warp_h5 or pair_string not in f_conf_h5:
+                logging.warning(f"Warp or confidence not found for pair {pair_string}, skipping.")
+                continue
+            warp_A_B = f_warp_h5[pair_string][()].astype(np.float32)
+            confidence_A_B = f_conf_h5[pair_string][()].astype(np.float32) / 255.0
 
         W = confidence_A_B.shape[1]
         H = confidence_A_B.shape[0]
@@ -182,7 +228,8 @@ if __name__ == '__main__':
 
     parser.add_argument('--inputSfMData', type=str, help='')
     parser.add_argument('--imagePairsList', type=str, help='')
-    parser.add_argument('--warpFolder', type=str, help='')
+    parser.add_argument('--warpArchive', type=str, help='')
+    parser.add_argument('--confidenceArchive', type=str, help='')
     parser.add_argument('--featuresFolder', type=str, help='')
     parser.add_argument('--output', type=str, help='')
     parser.add_argument('--masksFolder', type=str, help='')
@@ -197,7 +244,8 @@ if __name__ == '__main__':
     if hasattr(args, 'func'): 
         args.func(inputSfMData=args.inputSfMData,
                 imagePairsList=args.imagePairsList,
-                warpFolder=args.warpFolder,
+                warpArchive=args.warpArchive,
+                confidenceArchive=args.confidenceArchive,
                 featuresFolder=args.featuresFolder,
                 matchesFolder=args.output,
                 masksFolder=args.masksFolder,
