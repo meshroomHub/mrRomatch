@@ -76,10 +76,16 @@ def save_image(path, array, isBW = False):
     """
     
     image = []
-    if isBW:
-        image = avimage.Image_float()
-    else: 
-        image = avimage.Image_RGBfColor()
+    if array.dtype == np.uint8:
+        if isBW:
+            image = avimage.Image_uchar()
+        else: 
+            image = avimage.Image_RGBColor()
+    else:
+        if isBW:
+            image = avimage.Image_float()
+        else: 
+            image = avimage.Image_RGBfColor()
     
     image.fromNumpyArray(array)
 
