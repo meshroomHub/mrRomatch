@@ -55,12 +55,65 @@ def prepare_views(model, setting, infos, index_path, chunk, batch=1):
     writer.close_and_link()
 
 
+class PrepareArchives:
+    """
+    Read-only view over several RomaPrepare archives, looked up like a single ``h5py.File``.
+
+    A view present in several archives is read from the first one listing it.
+
+    Args:
+        paths (list[str]): Archive paths, in priority order.
+    """
+
+    def __init__(self, paths):
+        import h5py
+
+        self._files = []
+        self._groups = {}
+        duplicates = 0
+        try:
+            for path in paths:
+                f = h5py.File(path, "r")
+                self._files.append(f)
+                for key in f.keys():
+                    if key in self._groups:
+                        duplicates += 1
+                    else:
+                        self._groups[key] = f
+        except BaseException:
+            self.close()
+            raise
+        if duplicates:
+            logging.warning(f"{duplicates} views found in several prepare archives, using the first one")
+
+    def __getitem__(self, key):
+        return self._groups[key][key]
+
+    def __contains__(self, key):
+        return key in self._groups
+
+    def keys(self):
+        return self._groups.keys()
+
+    def close(self):
+        for f in self._files:
+            f.close()
+        self._files = []
+        self._groups = {}
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        self.close()
+
+
 def load_view(index, view_id, device, with_images=False, half=False):
     """
     Load the prepared data of a view.
 
     Args:
-        index (h5py.File): Open archive written by :func:`prepare_views`.
+        index (h5py.File | PrepareArchives): Open archive(s) written by :func:`prepare_views`.
         view_id (int): View id.
         device: Torch device to place the tensors on.
         with_images (bool): Also load the resized images.
@@ -92,7 +145,7 @@ def read_setting(index, view_ids):
     Archives written before settings were stored hold ``precise`` data.
 
     Args:
-        index (h5py.File): Open archive written by :func:`prepare_views`.
+        index (h5py.File | PrepareArchives): Open archive(s) written by :func:`prepare_views`.
         view_ids (iterable[int]): Views to check.
 
     Returns:

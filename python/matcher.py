@@ -5,7 +5,7 @@ Each unordered pair is computed once. The coarse matcher always runs both
 directions; only the listed directions are refined (both when the loop check
 is on). Pairs are matched in an order that reuses the per-image fine
 features held in a GPU LRU cache. A background loader (:mod:`prefetch`) reads
-the views from the prepare archive ahead of the GPU. A single writer thread post-processes the
+the views from the prepare archives ahead of the GPU. A single writer thread post-processes the
 listed directions and stores them under ``"<ref>_<other>"`` keys.
 """
 import logging
@@ -14,7 +14,6 @@ import threading
 import time
 from dataclasses import dataclass
 
-import h5py
 import numpy as np
 import torch
 
@@ -23,7 +22,7 @@ from directions import finalize_direction
 from fineCache import FineCache, capacity_from_vram
 from pairTiling import assign_chunks, canonicalize, order_for_cache
 from prefetch import Prefetcher
-from prepare import load_view
+from prepare import PrepareArchives, load_view
 from shardWriter import ShardWriter
 
 ABORT = object()  # writer sentinel: the GPU pass failed, close shards without linking
@@ -90,7 +89,7 @@ def _make_cache(model, first, seed, capacity, prefetch, device):
     return cache
 
 
-def _match_pairs(model, pairs, order, index, index_path, dirs, params, device, put):
+def _match_pairs(model, pairs, order, index, index_paths, dirs, params, device, put):
     """
     Coarse and refine every pair in cache-friendly order.
 
@@ -98,8 +97,8 @@ def _match_pairs(model, pairs, order, index, index_path, dirs, params, device, p
         model: RoMaV2 model.
         pairs (list[tuple[int, int]]): Canonical pairs, non-empty.
         order (dict[int, int]): View id -> rank.
-        index (h5py.File): Open prepare archive.
-        index_path (str): Its path, for the background loader.
+        index (PrepareArchives): Open prepare archives.
+        index_paths (list[str]): Their paths, for the background loader.
         dirs (dict): Listed directions per canonical pair.
         params (Params): Matching parameters.
         device: Torch device.
@@ -108,7 +107,7 @@ def _match_pairs(model, pairs, order, index, index_path, dirs, params, device, p
     first = pairs[0][0]
     capacity, images, seed = _cache_size(model, index, first, device)
     sequence = order_for_cache(pairs, order, images)
-    prefetch = Prefetcher(index_path, [first] + _views_in_order(sequence), with_images=True)
+    prefetch = Prefetcher(index_paths, [first] + _views_in_order(sequence), with_images=True)
     try:
         cache = _make_cache(model, first, seed, capacity, prefetch, device)
         for a, b in sequence:
@@ -178,7 +177,7 @@ def _writer_loop(q, out, chunk, dirs, params, errors):
             pass
 
 
-def run_chunk(model, pairs_canon, dirs, order, prepare_index, out, chunk, params):
+def run_chunk(model, pairs_canon, dirs, order, prepare_archives, out, chunk, params):
     """
     Match the canonical pairs of one chunk and write the listed directions.
 
@@ -187,7 +186,7 @@ def run_chunk(model, pairs_canon, dirs, order, prepare_index, out, chunk, params
         pairs_canon (list[tuple[int, int]]): Canonical pairs (a, b), order[a] < order[b].
         dirs (dict[tuple[int, int], set[str]]): Listed directions per pair ("AB" -> key "a_b", "BA" -> key "b_a").
         order (dict[int, int]): View id -> unique rank.
-        prepare_index (str): Path of the RomaPrepare archive.
+        prepare_archives (list[str]): Paths of the RomaPrepare archives.
         out (dict[str, str | None]): Index paths ``warp``, ``confidence`` and ``covariance`` (or None).
         chunk (int): Chunk number, selecting the shard files.
         params (Params): Matching parameters.
@@ -206,9 +205,9 @@ def run_chunk(model, pairs_canon, dirs, order, prepare_index, out, chunk, params
 
     start = time.perf_counter()
     try:
-        with h5py.File(prepare_index, "r") as index:
+        with PrepareArchives(prepare_archives) as index:
             if pairs_canon:
-                _match_pairs(model, pairs_canon, order, index, prepare_index, dirs, params, device, put)
+                _match_pairs(model, pairs_canon, order, index, prepare_archives, dirs, params, device, put)
     except BaseException as e:
         q.put(ABORT)
         writer.join()
@@ -232,7 +231,7 @@ def plan_chunk(pairs, order, prepared, chunk, chunk_count):
     Args:
         pairs (list[tuple[int, int]]): Directed pairs from the pair list.
         order (dict[int, int]): View id -> rank, for the views of the sfmData.
-        prepared (set[str]): View ids (as strings) present in the prepare archive.
+        prepared (set[str]): View ids (as strings) present in the prepare archives.
         chunk (int): Chunk number.
         chunk_count (int): Number of chunks.
 
@@ -245,7 +244,7 @@ def plan_chunk(pairs, order, prepared, chunk, chunk_count):
             logging.warning(f"Dropping pairs with view {view_id}: not in the sfmData")
             missing.add(view_id)
         elif str(view_id) not in prepared:
-            logging.warning(f"Dropping pairs with view {view_id}: not in the prepare archive")
+            logging.warning(f"Dropping pairs with view {view_id}: not in the prepare archives")
             missing.add(view_id)
     canon = canonicalize([p for p in pairs if p[0] not in missing and p[1] not in missing], order)
     chunk_pairs = assign_chunks(canon, order, chunk_count)[chunk]
@@ -253,7 +252,7 @@ def plan_chunk(pairs, order, prepared, chunk, chunk_count):
 
 
 def compute_matches(inputSfMData, imagePairsList, minConfidence, outputWarpArchive, outputConfidenceArchive,
-                    outputCovarianceArchive, checkLoops, loopThreshold, outputCovarianceFlag, prepareArchive,
+                    outputCovarianceArchive, checkLoops, loopThreshold, outputCovarianceFlag, prepareArchives,
                     rangeIteration, rangeBlocksCount):
     """
     Run RoMa dense matching on one parallelization block of the pair list.
@@ -268,7 +267,7 @@ def compute_matches(inputSfMData, imagePairsList, minConfidence, outputWarpArchi
         checkLoops (bool): Apply loop-closure filtering.
         loopThreshold (float): Maximum round-trip error in pixels.
         outputCovarianceFlag (bool): Also write the covariance archive.
-        prepareArchive (str): Archive written by RomaPrepare; it also gives the RoMa setting.
+        prepareArchives (list[str]): Archives written by RomaPrepare nodes; they also give the RoMa setting.
         rangeIteration (int): Index of the current processing block.
         rangeBlocksCount (int): Total number of processing blocks.
     """
@@ -284,14 +283,16 @@ def compute_matches(inputSfMData, imagePairsList, minConfidence, outputWarpArchi
     pairs = [(int(p[0]), int(p[1])) for p in plist]
     logging.info(f"Loaded {len(pairs)} pairs from list")
 
-    with h5py.File(prepareArchive, "r") as index:
+    if not prepareArchives:
+        raise RuntimeError("No prepare archive given")
+    with PrepareArchives(prepareArchives) as index:
         prepared = set(index.keys())
     pairs_canon, dirs = plan_chunk(pairs, order, prepared, rangeIteration, rangeBlocksCount)
     logging.info(f"Processing {len(pairs_canon)} unordered pairs in block {rangeIteration}/{rangeBlocksCount}")
 
     model = None
     if pairs_canon:
-        with h5py.File(prepareArchive, "r") as index:
+        with PrepareArchives(prepareArchives) as index:
             setting = read_setting(index, {v for pair in pairs_canon for v in pair})
         logging.info(f"Loading model, setting {setting}")
         model = romaCore.load_model(setting)
@@ -304,7 +305,7 @@ def compute_matches(inputSfMData, imagePairsList, minConfidence, outputWarpArchi
         "confidence": outputConfidenceArchive,
         "covariance": outputCovarianceArchive if outputCovarianceFlag else None,
     }
-    run_chunk(model, pairs_canon, dirs, order, prepareArchive, out, rangeIteration, params)
+    run_chunk(model, pairs_canon, dirs, order, prepareArchives, out, rangeIteration, params)
 
 
 if __name__ == '__main__':
@@ -324,7 +325,7 @@ if __name__ == '__main__':
     parser.add_argument('--checkLoops', type=str_to_bool, help='', default=False)
     parser.add_argument('--loopThreshold', type=float, help='Maximum accepted round-trip distance in pixels', default=3.0)
     parser.add_argument('--outputCovarianceFlag', type=str_to_bool, help='', default=False)
-    parser.add_argument('--prepareArchive', type=str, help='Archive written by RomaPrepare')
+    parser.add_argument('--prepareArchives', nargs='*', default=[], help='Archives written by RomaPrepare nodes')
     parser.add_argument('--rangeIteration', type=int, help='', default=0)
     parser.add_argument('--rangeBlocksCount', type=int, help='', default=1)
     args = parser.parse_args()

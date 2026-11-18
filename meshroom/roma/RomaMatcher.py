@@ -1,4 +1,4 @@
-__version__ = "2.1"
+__version__ = "3.0"
 
 import os 
 from pathlib import Path
@@ -9,9 +9,9 @@ class RomaMatcher(desc.CommandLineNode):
 
     category = "ROMA"
     documentation = """
-    Compute ROMA warp and confidence images on a list of images pairs, using the per-image data of RomaPrepare.
+    Compute ROMA warp and confidence images on a list of images pairs, using the per-image data of one or more RomaPrepare nodes.
     Each unordered pair is computed once; only the listed directions are refined (both when Check Loops is on).
-    The RoMa setting (resolutions, number of refinement stages) is the one chosen in RomaPrepare.
+    The RoMa setting (resolutions, number of refinement stages) is the one chosen in RomaPrepare; all the matched views must share it.
 
     Memory: a background loader reads the views of the job's block ahead of the GPU and keeps their DINO features
     and resized images in RAM (about 25 MB per view in the precise setting, float16). Blocks are counted in image pairs; smaller blocks
@@ -44,11 +44,18 @@ class RomaMatcher(desc.CommandLineNode):
             description="Path to a file which contains the list of image pairs to match.",
             value="",
         ),
-        desc.File(
-            name="prepareArchive",
-            label="Prepare Archive",
-            description="Archive written by RomaPrepare for the same SfMData.",
-            value="",
+        desc.ListAttribute(
+            name="prepareArchives",
+            label="Prepare Archives",
+            description="Archives written by RomaPrepare nodes. Each view is looked up in the first archive holding it;\n"
+                        "all the matched views must have been prepared with the same RoMa setting.",
+            elementDesc=desc.File(
+                name="prepareArchive",
+                label="Prepare Archive",
+                description="Archive written by RomaPrepare.",
+                value="",
+            ),
+            exposed=True,
         ),
         desc.BoolParam(
             name="checkLoops",

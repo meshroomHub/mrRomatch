@@ -6,7 +6,7 @@
 Compute once per image the resized inputs and DINO features needed by ROMA matching and store them in an archive, so that they are not recomputed for every pair. The RoMa setting (turbo, fast, base or precise) is chosen here and used by RomaMatcher. Uses GPU processing.
 
 ### RomaMatcher
-Compute ROMA warp and confidence images on a list of image pairs, using the archive of RomaPrepare. Each unordered pair is matched once for both directions, and the refinement reuses per-image features cached on the GPU. Writes warp, confidence and covariance archives. On Ampere and newer GPUs the refiners are compiled with torch.compile. Uses GPU processing.
+Compute ROMA warp and confidence images on a list of image pairs, using the archives of one or more RomaPrepare nodes (each view is read from the first archive holding it). Each unordered pair is matched once for both directions, and the refinement reuses per-image features cached on the GPU. Writes warp, confidence and covariance archives. On Ampere and newer GPUs the refiners are compiled with torch.compile. Uses GPU processing.
 
 ### RomaFeaturesMatcher
 Use the Roma warp images to restrict the region used to match features. A region will only be matched to features in the other image given the warp image coordinates.

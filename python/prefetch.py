@@ -1,29 +1,27 @@
 """Background loading of RomaPrepare views, ahead of the GPU.
 
-Reading a view from the prepare archive on network storage takes ~100 ms for the
+Reading a view from a prepare archive on network storage takes ~100 ms for the
 DINO features and ~250 ms for the images, which would otherwise stall the GPU on
 every fine-cache miss. A loader thread reads the views in the order the matcher
-will need them, with its own file handle, and keeps them in CPU memory (float16,
+will need them, with its own file handles, and keeps them in CPU memory (float16,
 as stored) until the end of the chunk.
 """
 import threading
 
-import h5py
-
-from prepare import load_view
+from prepare import PrepareArchives, load_view
 
 
 class Prefetcher:
     """
-    Load views of a prepare archive in a background thread.
+    Load views of RomaPrepare archives in a background thread.
 
     Args:
-        index_path (str): Path of the RomaPrepare archive.
+        index_paths (list[str]): Paths of the RomaPrepare archives.
         view_order (list[int]): Views to load, in the order they will be needed (duplicates ignored).
         with_images (bool): Also load the resized images.
     """
 
-    def __init__(self, index_path, view_order, with_images):
+    def __init__(self, index_paths, view_order, with_images):
         self._order = list(dict.fromkeys(view_order))
         self._known = set(self._order)
         self._with_images = with_images
@@ -31,12 +29,12 @@ class Prefetcher:
         self._error = None
         self._stop = False
         self._cond = threading.Condition()
-        self._thread = threading.Thread(target=self._run, args=(index_path,), daemon=True)
+        self._thread = threading.Thread(target=self._run, args=(index_paths,), daemon=True)
         self._thread.start()
 
-    def _run(self, index_path):
+    def _run(self, index_paths):
         try:
-            with h5py.File(index_path, "r") as index:
+            with PrepareArchives(index_paths) as index:
                 for view_id in self._order:
                     if self._stop:
                         return
