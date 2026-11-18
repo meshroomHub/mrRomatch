@@ -5,62 +5,11 @@ from pyalicevision import system as avsys
 
 from common import *
 
-import math
 import os
-import time
 import logging
 import h5py, hdf5plugin
 
-from pathlib import Path
-
-
-def _acquire_archive_lock(lock_path, timeout_s=600.0, poll_s=0.1, stale_lock_s=3600.0):
-    """
-    Acquire an inter-process lock file with timeout and stale lock handling.
-
-    Args:
-        lock_path (str): Path of the lock file to create.
-        timeout_s (float): Maximum time to wait before failing.
-        poll_s (float): Sleep duration between retries.
-        stale_lock_s (float): If an existing lock is older than this threshold,
-            it is considered stale and removed.
-    """
-    start = time.monotonic()
-
-    while True:
-        try:
-            lfd = os.open(lock_path, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
-            with os.fdopen(lfd, "w") as lock_fd:
-                lock_fd.write(f"pid={os.getpid()}\n")
-                lock_fd.write(f"created={time.time()}\n")
-            return
-        except FileExistsError:
-            # Try to recover from stale lock files left behind by crashes.
-            try:
-                lock_age = time.time() - os.path.getmtime(lock_path)
-                if lock_age > stale_lock_s:
-                    logging.warning(f"Removing stale lock file: {lock_path}")
-                    os.unlink(lock_path)
-                    continue
-            except FileNotFoundError:
-                # Lost race: lock disappeared between exists check and stat.
-                continue
-
-            waited = time.monotonic() - start
-            if waited >= timeout_s:
-                raise TimeoutError(
-                    f"Timed out after {timeout_s:.1f}s waiting for lock: {lock_path}"
-                )
-
-            time.sleep(poll_s)
-
-
-def _release_archive_lock(lock_path):
-    """Release lock file if it exists."""
-    try:
-        os.unlink(lock_path)
-    except FileNotFoundError:
-        pass
+from shardWriter import ShardWriter
 
 
 def parse_masks_folders(masksFolders):
@@ -122,6 +71,39 @@ def find_mask_paths(masksFolders, mask_filename):
     return paths
 
 
+def load_mask(masksFolders, masksExtension, iinfo, width, height):
+    """
+    Load the mask(s) of an image, resampled to the warp resolution.
+
+    Several masks found across folders are combined with a minimum.
+
+    Args:
+        masksFolders (list[str]): Ordered list of directories to search.
+        masksExtension (str): Mask file extension.
+        iinfo: ImageInfo of the view (its path gives the mask stem).
+        width (int): Output width.
+        height (int): Output height.
+
+    Returns:
+        numpy.ndarray | None: uint8 mask of shape (height, width), or None if
+            no mask file exists for this image.
+    """
+    stem = os.path.splitext(os.path.basename(iinfo.path))[0]
+    mask_paths = find_mask_paths(masksFolders, f"{stem}.{masksExtension}")
+    if not mask_paths:
+        return None
+
+    logging.info(f"Found mask(s) at {mask_paths}")
+    mask = None
+    for path in mask_paths:
+        maskLarge = open_image(path, isBW=True, isFloat=False)
+        maskSmall = avimage.Image_uchar()
+        avimage.resampleImage(width, height, maskLarge, maskSmall, False)
+        current = np.squeeze(maskSmall.getNumpyArray()).copy()
+        mask = current if mask is None else np.minimum(mask, current)
+    return mask
+
+
 def apply_masks(inputSfMData, imagePairsList, warpArchive, confidenceArchive, masksFolders, masksExtension, outputConfidenceArchive, rangeIteration, rangeBlocksCount):
     """
     Apply binary masks to dense confidence maps and write the results to disk.
@@ -178,108 +160,63 @@ def apply_masks(inputSfMData, imagePairsList, warpArchive, confidenceArchive, ma
     logging.info(f"Processing elements {rangeStart} to {rangeEnd}")
     
 
-    # loop over pairs of images
-    for item in pairsToProcess:
-        
-        #id of views
-        referenceId = item[0]
-        otherId = item[1]
+    # Resampled masks by (viewId, width, height); None when the view has no mask.
+    mask_cache = {}
 
-        # retrieve ImageInfos
-        reference_iinfo = iinfos[referenceId]
-        other_iinfo = iinfos[otherId]
+    def get_mask(viewId, width, height):
+        key = (viewId, width, height)
+        if key not in mask_cache:
+            mask_cache[key] = load_mask(masksFolders, masksExtension, iinfos[viewId], width, height)
+        return mask_cache[key]
 
-        #Build paths
-        pair_string = str(referenceId) + "_" + str(otherId)
-
-        logging.info(f"Processing pair {pair_string}")
-
-        #load images
-        with h5py.File(warpArchive, "r") as f_warp_h5, \
-             h5py.File(confidenceArchive, "r") as f_conf_h5:
-            if pair_string not in f_conf_h5 or pair_string not in f_warp_h5:
-                continue
-            warp_A_B = f_warp_h5[pair_string][()].astype(np.float32)
-            confidence_A_B = f_conf_h5[pair_string][()].astype(np.float32) / 255.0
-
-        #get properties
-        warpHeight = confidence_A_B.shape[0]
-        warpWidth = confidence_A_B.shape[1]
-
-        #upgrade coordinates
-        warp_A_B[:, :, 0] *= warp_A_B.shape[1]
-        warp_A_B[:, :, 1] *= warp_A_B.shape[0]
-
-        #Build resized masks
-        maskReference = None
-        maskOther = None
-        # Replace the extension with the mask extension
-        stem = os.path.splitext(os.path.basename(reference_iinfo.path))[0]
-        mask_filename = f"{stem}.{masksExtension}"
-
-        # Build the path to the correct mask
-        mask_paths = find_mask_paths(masksFolders, mask_filename)
-
-        #Build mask for reference
-        if mask_paths:
-            logging.info(f"Found reference mask(s) at {mask_paths}")
-            maskLarge = open_image(mask_paths[0], isBW=True, isFloat=False)
-            maskSmall = avimage.Image_uchar()
-            avimage.resampleImage(warpWidth, warpHeight, maskLarge, maskSmall, False)
-            maskReference = np.squeeze(maskSmall.getNumpyArray())
-            for extra_path in mask_paths[1:]:
-                maskLargeExtra = open_image(extra_path, isBW=True, isFloat=False)
-                maskSmallExtra = avimage.Image_uchar()
-                avimage.resampleImage(warpWidth, warpHeight, maskLargeExtra, maskSmallExtra, False)
-                maskReference = np.minimum(maskReference, np.squeeze(maskSmallExtra.getNumpyArray()))
-
-        # Replace the extension with the mask extension
-        stem = os.path.splitext(os.path.basename(other_iinfo.path))[0]
-        mask_filename = f"{stem}.{masksExtension}"
-
-        # Build the path to the correct mask
-        mask_paths = find_mask_paths(masksFolders, mask_filename)
-
-        if mask_paths:
-            logging.info(f"Found comparison mask(s) at {mask_paths}")
-            maskLarge = open_image(mask_paths[0], isBW=True, isFloat=False)
-            maskSmall = avimage.Image_uchar()
-            avimage.resampleImage(warpWidth, warpHeight, maskLarge, maskSmall, False)
-            maskOther = np.squeeze(maskSmall.getNumpyArray())
-            for extra_path in mask_paths[1:]:
-                maskLargeExtra = open_image(extra_path, isBW=True, isFloat=False)
-                maskSmallExtra = avimage.Image_uchar()
-                avimage.resampleImage(warpWidth, warpHeight, maskLargeExtra, maskSmallExtra, False)
-                maskOther = np.minimum(maskOther, np.squeeze(maskSmallExtra.getNumpyArray()))
-
-        #make sure masks exist
-        if maskReference is None:
-            continue
-        
-        #masking using reference mask is straightforward
-        confidence_A_B[maskReference == 0] = 0
-
-        if maskOther is not None:
-            x = warp_A_B[:, :, 0].astype(np.int64)
-            y = warp_A_B[:, :, 1].astype(np.int64)
-
-            valid = (x >= 0) & (y >= 0) & (x < maskOther.shape[1]) & (y < maskOther.shape[0])
-
-            masked_other = np.zeros_like(valid, dtype=bool)
-            masked_other[valid] = maskOther[y[valid], x[valid]] == 0
-            confidence_A_B[masked_other] = 0
-         
-        
-        #write output
-        lock_path = f"{outputConfidenceArchive}.lock"
-        _acquire_archive_lock(lock_path)
+    with h5py.File(warpArchive, "r") as f_warp_h5, \
+         h5py.File(confidenceArchive, "r") as f_conf_h5:
+        writer = ShardWriter(outputConfidenceArchive, rangeIteration)
         try:
-            with h5py.File(outputConfidenceArchive, "a") as f_out:
-                if pair_string in f_out:
-                    del f_out[pair_string]
-                f_out.create_dataset(pair_string, data=(confidence_A_B * 255.0).astype(np.uint8), dtype=np.uint8, **hdf5plugin.LZ4(), chunks=True)
-        finally:
-            _release_archive_lock(lock_path)
+            # loop over pairs of images
+            for referenceId, otherId in pairsToProcess:
+                pair_string = str(referenceId) + "_" + str(otherId)
+
+                if pair_string not in f_conf_h5 or pair_string not in f_warp_h5:
+                    continue
+
+                conf_ds = f_conf_h5[pair_string]
+                warpHeight, warpWidth = conf_ds.shape[0], conf_ds.shape[1]
+
+                # Pairs without a reference mask are not written.
+                maskReference = get_mask(referenceId, warpWidth, warpHeight)
+                if maskReference is None:
+                    continue
+
+                logging.info(f"Processing pair {pair_string}")
+
+                confidence_A_B = conf_ds[()].astype(np.float32) / 255.0
+
+                #masking using reference mask is straightforward
+                confidence_A_B[maskReference == 0] = 0
+
+                maskOther = get_mask(otherId, warpWidth, warpHeight)
+                if maskOther is not None:
+                    warp_A_B = f_warp_h5[pair_string][()].astype(np.float32)
+
+                    #upgrade coordinates
+                    warp_A_B[:, :, 0] *= warp_A_B.shape[1]
+                    warp_A_B[:, :, 1] *= warp_A_B.shape[0]
+
+                    x = warp_A_B[:, :, 0].astype(np.int64)
+                    y = warp_A_B[:, :, 1].astype(np.int64)
+
+                    valid = (x >= 0) & (y >= 0) & (x < maskOther.shape[1]) & (y < maskOther.shape[0])
+
+                    masked_other = np.zeros_like(valid, dtype=bool)
+                    masked_other[valid] = maskOther[y[valid], x[valid]] == 0
+                    confidence_A_B[masked_other] = 0
+
+                writer.write(pair_string, (confidence_A_B * 255.0).astype(np.uint8), np.uint8)
+        except BaseException:
+            writer.close()
+            raise
+        writer.close_and_link()
 
 if __name__ == '__main__':
     import argparse
